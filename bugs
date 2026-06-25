@@ -1,0 +1,474 @@
+Comprehensive QA Audit Report
+
+System: EU→CIS Concierge Delivery Platform
+Backend: Django 6 / DRF / SQLite3 (delivery-service)
+Mobile: Flutter / Riverpod / GoRouter (mobile-ds)
+Audit date: 2026-06-21
+
+---
+Critical
+
+---
+C-1 — Hardcoded localhost base URL in mobile app — production connection failure
+
+Severity: Critical
+File: mobile-ds/lib/core/network/api_endpoints.dart:3
+
+Description:
+The mobile API base URL is http://localhost:8000/api/v1. On any real Android or iOS device, localhost resolves to the device itself, not the server. Every API call fails immediately. The URL also uses plain HTTP instead of HTTPS.
+
+Steps to reproduce:
+1. Install the app on a physical device.
+2. Attempt login.
+
+Expected: Login succeeds against the backend server.
+Actual: Network error — cannot connect to localhost:8000.
+
+Root cause: Development placeholder was never parameterised.
+
+Recommended fix:
+Drive the base URL from environment/flavor configuration (--dart-define=API_BASE_URL=https://api.example.com); remove the hard-coded default. Enforce HTTPS.
+
+---
+C-2 — Zombie authenticated state after refresh-token expiry
+
+Severity: Critical
+File: mobile-ds/lib/core/network/auth_interceptor.dart:62-65
+
+Description:
+When the JWT refresh call fails (expired refresh token, revoked token), the interceptor clears stored tokens but never notifies AuthNotifier. The routerProvider redirect only fires when authNotifierProvider emits a new state. The app remains on authenticated routes, all subsequent API calls return 401, and the user cannot log in again without force-killing the app.
+
+Steps to reproduce:
+1. Log in; let the refresh token expire server-side or manually revoke it.
+2. Open any screen that calls the API.
+
+Expected: App redirects to /login.
+Actual: Error banners appear on every screen; the app never navigates to /login.
+
+Root cause:
+} on DioException {
+    await tokenStorage.clearTokens();
+    return handler.next(err);  // auth state is never updated
+}
+
+Recommended fix:
+Inject a reference to AuthNotifier (or use a global Ref) into AuthInterceptor and call ref.read(authNotifierProvider.notifier).logout() (or equivalent state update) when refresh fails.
+
+---
+C-3 — Default DEBUG=True and insecure SECRET_KEY in production
+
+Severity: Critical
+Files: config/settings.py:37-48
+
+Description:
+If deployed without setting DJANGO_DEBUG=false and DJANGO_SECRET_KEY, the server runs with DEBUG=True (full tracebacks returned to clients) and the publicly committed insecure secret key. This exposes stack traces, internal paths, database structure, and invalidates all session/CSRF security.
+
+Steps to reproduce:
+Deploy without setting the environment variables and trigger a server error.
+
+Expected: Opaque 500 response.
+Actual: Full Django debug traceback including code, local variables, and SQL queries returned to the client.
+
+Root cause:
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "django-insecure-…")
+DEBUG = os.environ.get("DJANGO_DEBUG", "true").lower() == "true"
+
+Recommended fix:
+When DEBUG=False, raise ImproperlyConfigured if DJANGO_SECRET_KEY is not set. Set the env-var default for DJANGO_DEBUG to "false".
+
+---
+High
+
+---
+H-1 — Registration race condition causes unhandled 500 on duplicate email
+
+Severity: High
+File: delivery/api/v1/auth/serializers.py:32-35
+
+Description:
+validate_email checks for existing emails with filter(email__iexact=value), then returns the value. Between the check and the create_user() call, a concurrent identical request can pass the same check. create_user() then raises django.db.IntegrityError (unique constraint), which is not caught by the DRF serializer layer or the custom exception handler and surfaces as a 500 Internal Server Error.
+
+Steps to reproduce:
+Send two simultaneous POST /auth/register requests with the same email.
+
+Expected: Second request returns 400 with "Email already exists."
+Actual: One request returns 500.
+
+Root cause: TOCTOU (time-of-check-time-of-use) race; IntegrityError not caught.
+
+Recommended fix:
+Wrap User.objects.create_user(...) in try/except IntegrityError and convert it to a serializers.ValidationError.
+
+---
+H-2 — LocMemCache incompatible with multi-process Gunicorn
+
+Severity: High
+File: config/settings.py:454-459
+
+Description:
+LocMemCache is process-local. With Gunicorn running multiple workers, each worker maintains its own isolated in-memory cache. Currency rate invalidation (CurrencyRateService.invalidate()), footer cache invalidation, and DeliverySetting.get_settings() are all backed by this cache. A rate update processed in worker A is invisible to workers B, C, D until their cache expires naturally. Customers can see stale FX rates mid-session.
+
+Steps to reproduce:
+Run Gunicorn with --workers 4, update a currency rate, and observe that some API requests still return the old rate.
+
+Expected: All workers reflect the new rate within one cache TTL.
+Actual: Rate is stale in 3 out of 4 workers indefinitely.
+
+Root cause: Per-process in-memory cache does not share state across OS processes.
+
+Recommended fix:
+Replace LocMemCache with FileBasedCache (viable for single-server without Redis) or add Redis when scaling. Alternatively, remove caching on objects that are rarely updated and always hit the DB.
+
+---
+H-3 — N+1 query on order list (item_count)
+
+Severity: High
+File: delivery/api/v1/orders/serializers.py:41-42
+
+Description:
+OrderListSerializer.get_item_count calls obj.items.count(), executing one SQL COUNT query per order in the paginated list. With a page size of 20 orders, the list endpoint fires 21 SQL queries (1 for orders + 20 for counts).
+
+Steps to reproduce:
+Call GET /api/v1/orders with Django's DEBUG_QUERIES enabled on a user with 20 orders.
+
+Expected: 1–2 queries (orders + prefetch).
+Actual: 21 queries; response time scales linearly with page size.
+
+Root cause: Lazy evaluation of reverse relation inside serializer without prefetch.
+
+Recommended fix:
+In the selector (get_user_orders), use queryset.annotate(item_count=Count('items')) and add item_count as a read-only integer field in OrderListSerializer (removing the SerializerMethodField).
+
+---
+H-4 — No rate limiting on authentication endpoints
+
+Severity: High
+File: config/settings.py (REST_FRAMEWORK section) — missing throttle config
+
+Description:
+POST /auth/login and POST /auth/register have no throttling. An attacker can attempt unlimited password guesses against any email address without restrictions.
+
+Steps to reproduce:
+Send 1,000 login requests in a loop for a known email.
+
+Expected: Requests throttled after N attempts (HTTP 429).
+Actual: All requests processed; password brute force is unrestricted.
+
+Root cause: DEFAULT_THROTTLE_CLASSES is not configured in REST_FRAMEWORK.
+
+Recommended fix:
+Add DRF's AnonRateThrottle / UserRateThrottle to DEFAULT_THROTTLE_CLASSES, or use a reverse-proxy-level rate limit (nginx limit_req). Apply a strict per-IP limit (e.g., 10/min) on auth endpoints specifically.
+
+---
+H-5 — validate_items unconditionally requires ≥1 item, blocks API SEND orders
+
+Severity: High
+File: delivery/api/v1/orders/serializers.py:82-85
+
+Description:
+OrderCreateSerializer.validate_items raises ValidationError("At least one item is required.") if the items list is empty. The field default is default=list, so if items is omitted entirely, it defaults to [] and triggers the validator. SEND orders (order_type=SEND) don't require items at creation time — items are added later by admin. Any API client (or automated test) that submits a SEND order without items gets a 422 error.
+
+Steps to reproduce:
+POST /api/v1/orders
+{"order_type": "SEND", "destination_country": "RU"}
+
+Expected: 201 Created — SEND order created with no items.
+Actual: 422 Validation error — "At least one item is required."
+
+Root cause: Validator doesn't check order_type before applying the item constraint.
+
+Recommended fix:
+Move the "at least one item" check inside the serializer's top-level validate() method and gate it on order_type == 'BUY'.
+
+---
+Medium
+
+---
+M-1 — Service-tracking fields omitted from OrderDetailSerializer
+
+Severity: Medium
+File: delivery/api/v1/orders/serializers.py:58-69
+
+Description:
+For SEND orders with transfer_method=SERVICE, the fields service_tracking, service_carrier, service_store, and service_pickup_code are stored on the order but not included in OrderDetailSerializer.Meta.fields. Mobile users with SERVICE orders can't see their tracking number or carrier through the API.
+
+Recommended fix:
+Add the four service_* fields to OrderDetailSerializer and update the Flutter OrderDetail model accordingly.
+
+---
+M-2 — Promo code and financial breakdown fields absent from API
+
+Severity: Medium
+File: delivery/api/v1/orders/serializers.py
+
+Description:
+promo_code_id, promo_discount_czk, promo_applied, delivery_cost_czk, and locked_czk_rate are not returned by OrderDetailSerializer. Clients cannot display the applied discount or understand the full pricing breakdown (especially for legacy CZK delivery cost orders).
+
+Recommended fix:
+Add read-only representations of promo and legacy CZK fields to the serializer.
+
+---
+M-3 — localCacheProvider timing issue silently skips profile caching
+
+Severity: Medium
+File: mobile-ds/lib/features/auth/providers/auth_provider.dart:99-104
+
+Description:
+_cacheProfile reads ref.read(localCacheProvider).valueOrNull. localCacheProvider is a FutureProvider; if SharedPreferences.getInstance() hasn't completed yet (first startup), valueOrNull is null and the profile is silently not persisted. On the next cold start with no network, the offline fallback returns null and the user is logged out despite having valid credentials.
+
+Recommended fix:
+Await localCacheProvider in AuthNotifier.build() before attempting to cache — the provider is already awaited there implicitly. For _cacheProfile, use await ref.read(localCacheProvider.future) instead of .valueOrNull.
+
+---
+M-4 — delivery_type deprecated field still in active validation code path
+
+Severity: Medium
+Files: delivery/models.py:229-238, delivery/services/validation.py:39, delivery/models.py:410-418
+
+Description:
+Order.delivery_type is marked "устарел" (deprecated) in verbose name but is still checked in OrderValidationService.validate_for_payment_approval and in Order.save() (legacy branch). This creates two parallel code paths for delivery method validation that can give inconsistent results. A VERIFICATION→AWAITING_PAYMENT transition can succeed if delivery_type is set even when delivery_method_ref is the intended field.
+
+Recommended fix:
+Create a data migration to set delivery_method_ref for all orders that still have only delivery_type set; then remove the legacy branch from Order.save() and the validation service.
+
+---
+M-5 — Auth retry uses bare _refreshClient, bypasses main-client interceptors
+
+Severity: Medium
+File: mobile-ds/lib/core/network/auth_interceptor.dart:60
+
+Description:
+After a successful token refresh, the original request is retried with _refreshClient.fetch(err.requestOptions). _refreshClient is a bare Dio instance without any logging, error-normalisation, or other interceptors attached to the main apiClientProvider. Retry responses skip whatever middleware the main client applies.
+
+Recommended fix:
+Store a reference to the main Dio instance in AuthInterceptor and use it for the retry: final retryResponse = await _mainClient.fetch(err.requestOptions).
+
+---
+M-6 — Testimonial.rating has no 1–5 range enforcement
+
+Severity: Medium
+File: delivery/models.py:1836
+
+Description:
+rating = models.PositiveSmallIntegerField(default=5)
+No validators=[MinValueValidator(1), MaxValueValidator(5)]. Admin can save ratings of 0 or 100, which would render oddly on the landing page star widget.
+
+Recommended fix:
+Add validators=[MinValueValidator(1), MaxValueValidator(5)] and a migration.
+
+---
+M-7 — cancel_order exposed via DELETE verb returns a body
+
+Severity: Medium
+File: delivery/api/v1/orders/views.py:109-120
+
+Description:
+REST convention: DELETE deletes a resource and returns 204 No Content. This endpoint cancels the order (a state transition) and returns the updated order body with HTTP 200. This breaks OpenAPI client code generators and is misleading in logs and monitoring.
+
+Recommended fix:
+Add a cancel action (POST /orders/{id}/cancel) and deprecate the DELETE path, or at minimum document the deviation clearly in the OpenAPI spec.
+
+---
+Low
+
+---
+L-1 — ALLOWED_HOSTS footgun when DEBUG=False without env var
+
+Severity: Low
+File: config/settings.py:46-50
+
+Description:
+When DEBUG=False and DJANGO_ALLOWED_HOSTS is not set, ALLOWED_HOSTS evaluates to []. Django blocks all requests with "Bad Request (400)". A deployment that forgets the env var silently goes down.
+
+Recommended fix:
+Add a startup check: if DEBUG=False and not ALLOWED_HOSTS, raise ImproperlyConfigured.
+
+---
+L-2 — ProviderContainer in main.dart never disposed
+
+Severity: Low
+File: mobile-ds/lib/main.dart:11
+
+Description:
+The manually created ProviderContainer is never disposed when the app exits. On platforms where the Dart VM doesn't terminate cleanly (background service scenarios), this leaks all provider subscriptions.
+
+Recommended fix:
+Wrap UncontrolledProviderScope teardown to call container.dispose(), or prefer ProviderScope (which handles disposal) and move the FCM setup into a provider initialized after the scope.
+
+---
+L-3 — No CAPTCHA or rate limit on shipping calculator form
+
+Severity: Low
+File: delivery/models.py:1711-1751 (ShippingCalculatorRequest)
+
+Description:
+The lead-capture shipping calculator form stores visitor email addresses and product URLs. There is no CAPTCHA, honeypot, or server-side rate limit. The form can be used to harvest valid emails, spam the admin inbox, or GDPR-scrape contact data.
+
+Recommended fix:
+Add IP-based rate limiting at the view level and a simple honeypot field on the form.
+
+---
+L-4 — FCM callback has no error handling
+
+Severity: Low
+File: mobile-ds/lib/main.dart:19-21
+
+Description:
+The FCM message callback calls container.read(notificationsNotifierProvider.notifier).add(...) without try/catch. If notificationsNotifierProvider is in an error state (storage failure), this throws an uncaught exception in a global callback context, which Flutter reports as an unhandled platform exception.
+
+Recommended fix:
+Wrap the callback body in try/catch (_) with a debugPrint fallback.
+
+---
+L-5 — Redundant absolute URL construction in AuthInterceptor
+
+Severity: Low
+File: mobile-ds/lib/core/network/auth_interceptor.dart:47-50
+
+Description:
+final response = await _refreshClient.post(
+  '${ApiEndpoints.baseUrl}${ApiEndpoints.refresh}',  // full URL
+  ...
+);
+_refreshClient already has baseUrl: ApiEndpoints.baseUrl. Passing the full absolute URL is redundant (Dio detects the http:// prefix and ignores baseUrl). This is not a bug but creates confusion.
+
+Recommended fix:
+Use just ApiEndpoints.refresh as the path.
+
+---
+L-6 — Order state machine doesn't differentiate SEND vs BUY pipeline
+
+Severity: Low
+File: delivery/api/v1/core/state_machines.py
+
+Description:
+OrderStateMachine.TRANSITIONS applies identically to both BUY and SEND orders. SEND orders that go through PURCHASED/EU_WAREHOUSE stages might not semantically apply (the service is sending the customer's own items, not purchasing them). If business rules diverge between types, the unified machine is a maintenance hazard.
+
+Recommended fix:
+Document in code (or via a type-specific validator) which transitions are valid for which order type. If the pipelines truly unify, add a comment to that effect.
+
+---
+Summary Table
+
+┌─────┬──────────┬──────────────┬─────────────────────────────────────────┐
+│ ID  │ Severity │     Area     │                  Title                  │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ C-1 │ Critical │ Mobile /     │ Hardcoded localhost base URL — app      │
+│     │          │ Config       │ unusable on real devices                │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ C-2 │ Critical │ Mobile /     │ Zombie auth state after refresh token   │
+│     │          │ Auth         │ expiry                                  │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ C-3 │ Critical │ Backend /    │ DEBUG=True + insecure SECRET_KEY        │
+│     │          │ Config       │ defaults                                │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ H-1 │ High     │ Backend /    │ Registration race → unhandled 500 on    │
+│     │          │ Auth         │ duplicate email                         │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ H-2 │ High     │ Backend /    │ LocMemCache stale FX rates across       │
+│     │          │ Cache        │ Gunicorn workers                        │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ H-3 │ High     │ Backend /    │ N+1 query on order list (item_count per │
+│     │          │ Orders       │  row)                                   │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ H-4 │ High     │ Backend /    │ No rate limiting on /auth/login and     │
+│     │          │ Security     │ /auth/register                          │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ H-5 │ High     │ Backend /    │ validate_items blocks SEND orders       │
+│     │          │ Orders       │ without items from API                  │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-1 │ Medium   │ Backend /    │ Service-tracking fields missing from    │
+│     │          │ API          │ OrderDetailSerializer                   │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-2 │ Medium   │ Backend /    │ Promo and CZK delivery cost fields      │
+│     │          │ API          │ missing from serializer                 │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-3 │ Medium   │ Mobile /     │ localCacheProvider async timing         │
+│     │          │ Cache        │ silently skips profile caching          │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-4 │ Medium   │ Backend /    │ Deprecated delivery_type field still in │
+│     │          │ Orders       │  active validation path                 │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-5 │ Medium   │ Mobile /     │ Retry after refresh bypasses            │
+│     │          │ Network      │ main-client interceptors                │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-6 │ Medium   │ Backend /    │ Testimonial.rating has no 1–5 range     │
+│     │          │ Models       │ validators                              │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ M-7 │ Medium   │ Backend /    │ cancel_order uses DELETE but returns a  │
+│     │          │ API          │ body (REST violation)                   │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ L-1 │ Low      │ Backend /    │ ALLOWED_HOSTS=[] footgun when           │
+│     │          │ Config       │ DEBUG=False without env var             │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ L-2 │ Low      │ Mobile /     │ ProviderContainer never disposed        │
+│     │          │ Resources    │                                         │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ L-3 │ Low      │ Backend /    │ No CAPTCHA/rate limit on shipping       │
+│     │          │ Security     │ calculator form                         │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ L-4 │ Low      │ Mobile / FCM │ FCM callback missing error handling     │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ L-5 │ Low      │ Mobile /     │ Redundant absolute URL in               │
+│     │          │ Network      │ AuthInterceptor                         │
+├─────┼──────────┼──────────────┼─────────────────────────────────────────┤
+│ L-6 │ Low      │ Backend /    │ Unified state machine doesn't           │
+│     │          │ Domain       │ differentiate SEND vs BUY pipeline      │
+└─────┴──────────┴──────────────┴─────────────────────────────────────────┘
+
+---
+Priority implementation order (business impact first):
+
+1. C-1 — App is non-functional on real devices. Fix before any real user testing.
+2. C-2 — Silent logout failure destroys session resilience.
+3. C-3 — Security prerequisite for any production deployment.
+4. H-4 — Brute-force risk on auth endpoints is exploitable from day one.
+5. H-1 — Registration 500 is user-facing and intermittent (harder to diagnose).
+6. H-2 — FX rate drift leads to incorrect pricing shown to customers.
+7. H-3 — Performance degrades linearly; impacts all list views.
+8. H-5 — API contract is broken for SEND orders from non-mobile clients.
+
+✻ Brewed for 5m 17s
+
+❯ fix C-1
+
+  Read 1 file
+
+The fix is to replace the hard-coded string with String.fromEnvironment, which reads from --dart-define=API_BASE_URL=… at build/run time. I'll keep a local-dev fallback (10.0.2.2 — the Android emulator loopback to the host machine) so the app still builds without the flag on a development machine.
+
+⏺ Update(mobile-ds/lib/core/network/api_endpoints.dart)
+Added 11 lines, removed 1 line
+abstract final class ApiEndpoints {
+  static const String baseUrl = 'http://localhost:8000/api/v1';
+  // Pass at build/run time:
+  //   flutter run  --dart-define=API_BASE_URL=https://api.your
+-domain.com
+  //   flutter build apk --dart-define=API_BASE_URL=https://api
+.your-domain.com
+  //
+  // Local dev fallback:
+  //   Android emulator → 10.0.2.2 reaches the host machine
+  //   iOS simulator    → use --dart-define=API_BASE_URL=http:/
+/localhost:8000/api/v1
+  static const String baseUrl = String.fromEnvironment(
+    'API_BASE_URL',
+    defaultValue: 'http://10.0.2.2:8000/api/v1',
+  );
+
+  // Auth
+  static const String register = '/auth/register';
+
+──────────────────────────────── 2 new messages ────────────────────────────────
+
+Now update CLAUDE.md to document the required flag so this never gets lost again.
+
+  Read 1 file
+
+⏺ Update(mobile-ds/CLAUDE.md)
+Added 19 lines
+- Avoid deeply nested widget trees; extract large widgets into
+separate stateless components.
+- Use `ResponsiveLayout` helpers for multi-platform responsiven
+ess (iOS/Android).
+
+## API B
